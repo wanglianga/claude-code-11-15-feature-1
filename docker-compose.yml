@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ccdev
+      POSTGRES_PASSWORD: ccdev
+      POSTGRES_DB: ccdev
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ccdev -d ccdev"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  server:
+    build: ./server
+    environment:
+      DATABASE_URL: postgres://ccdev:ccdev@db:5432/ccdev
+      PORT: 8080
+      AUTH_SECRET: change-me-in-production
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+  web:
+    build: ./web
+    depends_on:
+      - server
+    ports:
+      - "3000:80"
+
+volumes:
+  pgdata:
