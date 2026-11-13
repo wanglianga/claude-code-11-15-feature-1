@@ -79,6 +79,7 @@ async function forecastSku(
         AND business_date < $3::date
         AND business_date >= ($3::date - $4::int)
         AND excluded_from_training = FALSE
+        AND demand_class = 'regular'   -- 折价需求单列，不回喂模型
       ORDER BY business_date DESC`,
     [storeId, sku.id, arrivalDate, SAMPLE_WINDOW_DAYS],
   );
@@ -111,7 +112,8 @@ async function forecastSku(
         WHERE ds.store_id=$1 AND s.category_id=$2 AND ds.sku_id <> $3
           AND ds.business_date < $4::date
           AND ds.business_date >= ($4::date - $5::int)
-          AND ds.excluded_from_training = FALSE AND ds.degraded = FALSE`,
+          AND ds.excluded_from_training = FALSE AND ds.degraded = FALSE
+          AND ds.demand_class = 'regular'`,
       [storeId, sku.category_id, sku.id, arrivalDate, SAMPLE_WINDOW_DAYS],
     );
     const priorVals = prior.rows.map((r) => Number(r.restored_demand));

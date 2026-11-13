@@ -118,6 +118,18 @@ export default function ReviewPage({ meta }: { meta: Meta | null }) {
     }
   };
 
+  const confirmReview = async (reviewId: number) => {
+    try {
+      const r = await api<{ idempotent: boolean }>(`/api/reviews/${reviewId}/confirm`, {
+        method: 'POST', body: {},
+      });
+      showToast(r.idempotent ? '该复盘已确认' : '复盘已确认：重算不再追溯改写');
+      await load();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : '确认失败');
+    }
+  };
+
   const review = reviews[0];
   const skuOptions = meta?.skus ?? [];
   const filteredItems = review?.items.filter(
@@ -138,6 +150,9 @@ export default function ReviewPage({ meta }: { meta: Meta | null }) {
         <div className="card">
           <h3>
             复盘归因 <span className="sub">订单版本 v{review.version_no} · 基准口径：观测需求（restored_demand）· 金额按下单版本标定的 Cu/Co 快照计算</span>
+            {review.confirmed_at
+              ? <> <span className="badge green">已确认 · 重算不追溯</span></>
+              : <> <button onClick={() => confirmReview(review.id)}>确认复盘（锁定口径）</button></>}
           </h3>
           <table className="grid">
             <thead>
@@ -145,6 +160,7 @@ export default function ReviewPage({ meta }: { meta: Meta | null }) {
                 <th>SKU</th><th className="num">订货</th>
                 <th className="num">实销</th><th>断货标记</th><th>售罄时点</th><th className="num">报损</th>
                 <th className="num">观测需求</th><th className="num">缺货损失</th><th className="num">报损金额</th>
+                <th className="num">结转成本</th><th>成本归属日</th>
                 <th>样本回流</th><th></th>
               </tr>
             </thead>
@@ -200,6 +216,12 @@ export default function ReviewPage({ meta }: { meta: Meta | null }) {
                         ? <span className="badge amber">{Number(i.waste_cost).toFixed(0)} 元</span>
                         : '—'}
                     </td>
+                    <td className="num">
+                      {Number(i.carryover_cost) > 0
+                        ? <span className="badge blue">{Number(i.carryover_cost).toFixed(0)} 元</span>
+                        : '—'}
+                    </td>
+                    <td className="small">{i.cost_attribution_date ?? '—'}</td>
                     <td>
                       {entered
                         ? i.sample_excluded

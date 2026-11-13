@@ -3,6 +3,13 @@ import { pool } from './db';
 import { requireAuth, requireRole, scopeStoreId, signToken, verifyPassword } from './auth';
 import { confirmOrder, generateSuggestion, ConflictError, NotFoundError } from './services/suggestionService';
 import { addStocktake, addWasteRecord, createReview, submitReviewEntry } from './services/reviewService';
+import {
+  arriveBatch, createRuleVersion, listBatches, listCarryovers, listReconciliation, listRuleVersions,
+  reconcile, registerBatch, resolveReconciliationFlag, runCarryover, submitBatchStocktake,
+} from './services/shelfService';
+import { createMarkdownPlan, listMarkdown, recordMarkdownEntry } from './services/markdownService';
+import { confirmReview, getReplay, listReplays, replayHistory } from './services/replayService';
+import { todayStr } from './lib/dates';
 
 function num(v: unknown, name: string): number {
   const n = Number(v);
@@ -59,17 +66,19 @@ export function createApp() {
   // ---------- 基础数据 ----------
   app.get('/api/meta', async (_req, res, next) => {
     try {
-      const [stores, categories, skus, costParams, params] = await Promise.all([
+      const [stores, categories, skus, costParams, params, ruleVersions] = await Promise.all([
         pool().query('SELECT id, code, name FROM stores ORDER BY id'),
-        pool().query('SELECT id, code, name, default_cu, default_co FROM categories ORDER BY id'),
+        pool().query('SELECT id, code, name, default_cu, default_co, shelf_group, shelf_life_days FROM categories ORDER BY id'),
         pool().query('SELECT id, category_id, code, name, unit, min_order_unit, price, cost, is_new FROM skus ORDER BY id'),
         pool().query('SELECT store_id, category_id, cu, co FROM cost_params ORDER BY id'),
         pool().query('SELECT key, value FROM system_params'),
+        pool().query('SELECT id, version_no, name, effective_from, effective_to, status, rules FROM shelf_rule_versions ORDER BY version_no DESC'),
       ]);
       res.json({
         stores: stores.rows, categories: categories.rows, skus: skus.rows,
         costParams: costParams.rows,
         params: Object.fromEntries(params.rows.map((r) => [r.key, r.value])),
+        ruleVersions: ruleVersions.rows,
       });
     } catch (e) { next(e); }
   });
@@ -295,6 +304,242 @@ export function createApp() {
         [storeId, businessDate],
       );
       res.json({ stocktakes: r.rows });
+    } catch (e) { next(e); }
+  });
+
+  // ---------- 多期库存：分组规则版本 / 批次台账 ----------
+  app.get('/api/shelf/rule-versions', async (req, res, next) => {
+    try {
+      const date = optStr(req.query.date) ?? todayStr();
+      res.json(await listRuleVersions(pool(), date));
+    } catch (e) { next(e); }
+  });
+
+  // 新规则版本：不可变，原版本归档；生效日必须晚于当前生效版本
+  app.post('/api/shelf/rule-versions', requireRole('hq'), async (req, res, next) => {
+    try {
+      const result = await createRuleVersion({
+        name: str(req.body?.name, 'name'),
+        effectiveFrom: str(req.body?.effectiveFrom, 'effectiveFrom'),
+        rules: req.body?.rules ?? {},
+        createdBy: req.user!.username,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  app.get('/api/shelf/batches', async (req, res, next) => {
+    try {
+      res.json(await listBatches({
+        storeId: resolveStore(req, req.query.storeId),
+        businessDate: optStr(req.query.businessDate) ?? undefined,
+        categoryId: req.query.categoryId ? num(req.query.categoryId, 'categoryId') : null,
+        skuId: req.query.skuId ? num(req.query.skuId, 'skuId') : null,
+      }));
+    } catch (e) { next(e); }
+  });
+
+  app.post('/api/shelf/batches', async (req, res, next) => {
+    try {
+      const result = await registerBatch({
+        storeId: resolveStore(req, req.body?.storeId),
+        skuId: num(req.body?.skuId, 'skuId'),
+        batchNo: str(req.body?.batchNo, 'batchNo'),
+        arrivalDate: str(req.body?.arrivalDate, 'arrivalDate'),
+        qty: num(req.body?.qty, 'qty'),
+        unitCost: req.body?.unitCost === undefined ? undefined : num(req.body.unitCost, 'unitCost'),
+        businessDate: optStr(req.body?.businessDate) ?? undefined,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  app.post('/api/shelf/batches/:id/arrive', async (req, res, next) => {
+    try {
+      const b = await pool().query('SELECT store_id FROM batches WHERE id=$1', [num(req.params.id, 'id')]);
+      if (!b.rows[0]) throw new NotFoundError('批次不存在');
+      const storeId = scopeStoreId(req, Number(b.rows[0].store_id));
+      if (storeId === null) throw new ConflictError('FORBIDDEN', '门店账号只能操作本店数据');
+      const result = await arriveBatch({
+        storeId, batchId: num(req.params.id, 'id'),
+        businessDate: optStr(req.body?.businessDate) ?? undefined,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  // 批次盘点：以实物为基准；同一（批次, 盘点时点）重复上报幂等合并
+  app.post('/api/shelf/batch-stocktakes', async (req, res, next) => {
+    try {
+      const result = await submitBatchStocktake({
+        storeId: resolveStore(req, req.body?.storeId),
+        skuId: num(req.body?.skuId, 'skuId'),
+        batchId: num(req.body?.batchId, 'batchId'),
+        businessDate: str(req.body?.businessDate, 'businessDate'),
+        actualQty: num(req.body?.actualQty, 'actualQty'),
+        stocktakeAt: req.body?.stocktakeAt ? new Date(req.body.stocktakeAt) : undefined,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  app.get('/api/shelf/batch-stocktakes', async (req, res, next) => {
+    try {
+      const storeId = resolveStore(req, req.query.storeId);
+      const businessDate = optStr(req.query.businessDate);
+      const r = await pool().query(
+        `SELECT st.*, s.name AS sku_name, s.code AS sku_code, b.batch_no, b.expiry_date
+           FROM batch_stocktakes st
+           JOIN skus s ON s.id=st.sku_id
+           JOIN batches b ON b.id=st.batch_id
+          WHERE st.store_id=$1 AND ($2::date IS NULL OR st.business_date=$2)
+          ORDER BY st.stocktake_at DESC, st.id DESC`,
+        [storeId, businessDate],
+      );
+      res.json({
+        stocktakes: r.rows.map((s) => ({
+          ...s, system_qty: Number(s.system_qty), actual_qty: Number(s.actual_qty), difference: Number(s.difference),
+        })),
+      });
+    } catch (e) { next(e); }
+  });
+
+  // ---------- 结转引擎 ----------
+  app.post('/api/shelf/carryover', async (req, res, next) => {
+    try {
+      const result = await runCarryover({
+        storeId: resolveStore(req, req.body?.storeId),
+        businessDate: str(req.body?.businessDate, 'businessDate'),
+        // 结转按（门店, 营业日）一次闭环，品类只作展示筛选，不参与结转口径
+        categoryId: null,
+        stocktakeAt: req.body?.stocktakeAt ? new Date(req.body.stocktakeAt) : undefined,
+        idempotencyKey: optStr(req.body?.idempotencyKey) ?? undefined,
+        createdBy: req.user!.username,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  app.get('/api/shelf/carryover', async (req, res, next) => {
+    try {
+      res.json(await listCarryovers({
+        storeId: resolveStore(req, req.query.storeId),
+        businessDate: optStr(req.query.businessDate),
+      }));
+    } catch (e) { next(e); }
+  });
+
+  // 按到货日逐项对账：台账 / 结转结果 / 复盘口径
+  app.post('/api/shelf/reconcile', async (req, res, next) => {
+    try {
+      res.json(await reconcile({
+        storeId: resolveStore(req, req.body?.storeId),
+        dateFrom: str(req.body?.dateFrom, 'dateFrom'),
+        dateTo: str(req.body?.dateTo, 'dateTo'),
+        categoryId: req.body?.categoryId === undefined || req.body?.categoryId === null
+          ? null : num(req.body.categoryId, 'categoryId'),
+      }));
+    } catch (e) { next(e); }
+  });
+
+  app.get('/api/shelf/reconciliation', async (req, res, next) => {
+    try {
+      res.json(await listReconciliation({
+        storeId: resolveStore(req, req.query.storeId),
+        dateFrom: optStr(req.query.dateFrom),
+        dateTo: optStr(req.query.dateTo),
+      }));
+    } catch (e) { next(e); }
+  });
+
+  app.post('/api/shelf/reconciliation/:id/resolve', requireRole('hq'), async (req, res, next) => {
+    try {
+      const result = await resolveReconciliationFlag({
+        storeId: num(req.body?.storeId, 'storeId'),
+        flagId: num(req.params.id, 'id'),
+        note: str(req.body?.note, 'note'),
+        resolvedBy: req.user!.username,
+      });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  // ---------- 临期折价治理 ----------
+  app.get('/api/markdown', async (req, res, next) => {
+    try {
+      res.json(await listMarkdown({
+        storeId: resolveStore(req, req.query.storeId),
+        businessDate: optStr(req.query.businessDate),
+        categoryId: req.query.categoryId ? num(req.query.categoryId, 'categoryId') : null,
+      }));
+    } catch (e) { next(e); }
+  });
+
+  app.post('/api/markdown/plans', async (req, res, next) => {
+    try {
+      res.json(await createMarkdownPlan({
+        storeId: resolveStore(req, req.body?.storeId),
+        skuId: num(req.body?.skuId, 'skuId'),
+        batchId: num(req.body?.batchId, 'batchId'),
+        businessDate: str(req.body?.businessDate, 'businessDate'),
+        planQty: num(req.body?.planQty, 'planQty'),
+        discountRate: req.body?.discountRate === undefined ? undefined : num(req.body.discountRate, 'discountRate'),
+        idempotencyKey: str(req.body?.idempotencyKey, 'idempotencyKey'),
+        createdBy: req.user!.username,
+      }));
+    } catch (e) { next(e); }
+  });
+
+  app.post('/api/markdown/plans/:id/entries', async (req, res, next) => {
+    try {
+      const p = await pool().query('SELECT store_id FROM markdown_plans WHERE id=$1', [num(req.params.id, 'id')]);
+      if (!p.rows[0]) throw new NotFoundError('折价计划不存在');
+      const storeId = scopeStoreId(req, Number(p.rows[0].store_id));
+      if (storeId === null) throw new ConflictError('FORBIDDEN', '门店账号只能操作本店数据');
+      res.json(await recordMarkdownEntry({
+        planId: num(req.params.id, 'id'),
+        soldQty: num(req.body?.soldQty, 'soldQty'),
+        recordedAt: req.body?.recordedAt ? new Date(req.body.recordedAt) : undefined,
+        entryKey: optStr(req.body?.entryKey) ?? undefined,
+      }));
+    } catch (e) { next(e); }
+  });
+
+  // ---------- 历史复盘：确认 / 按当时规则版本重算未确认区间 ----------
+  app.post('/api/reviews/:id/confirm', async (req, res, next) => {
+    try {
+      const r = await pool().query('SELECT store_id FROM reviews WHERE id=$1', [num(req.params.id, 'id')]);
+      if (!r.rows[0]) throw new NotFoundError('复盘不存在');
+      const storeId = scopeStoreId(req, Number(r.rows[0].store_id));
+      if (storeId === null) throw new ConflictError('FORBIDDEN', '门店账号只能操作本店数据');
+      res.json(await confirmReview({
+        storeId, reviewId: num(req.params.id, 'id'), confirmedBy: req.user!.username,
+      }));
+    } catch (e) { next(e); }
+  });
+
+  app.get('/api/replays', async (req, res, next) => {
+    try {
+      res.json(await listReplays({ storeId: resolveStore(req, req.query.storeId) }));
+    } catch (e) { next(e); }
+  });
+
+  app.post('/api/replays', requireRole('hq'), async (req, res, next) => {
+    try {
+      res.json(await replayHistory({
+        storeId: resolveStore(req, req.body?.storeId),
+        dateFrom: str(req.body?.dateFrom, 'dateFrom'),
+        dateTo: str(req.body?.dateTo, 'dateTo'),
+        categoryId: req.body?.categoryId === undefined || req.body?.categoryId === null
+          ? null : num(req.body.categoryId, 'categoryId'),
+        createdBy: req.user!.username,
+      }));
+    } catch (e) { next(e); }
+  });
+
+  app.get('/api/replays/:id', async (req, res, next) => {
+    try {
+      res.json(await getReplay(resolveStore(req, req.query.storeId), num(req.params.id, 'id')));
     } catch (e) { next(e); }
   });
 

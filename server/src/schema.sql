@@ -202,5 +202,279 @@ INSERT INTO system_params(key, value) VALUES
   ('demand_baseline', 'restored_demand'),  -- 复盘归因基准：观测需求（还原后），中途不能换
   ('open_hours', '13'),                    -- 营业时长 08:00-21:00
   ('waste_window_hour', '12'),             -- 报损补录窗口：次日 12:00 前
-  ('rounding', 'ceil_to_min_order_unit')   -- 建议量向上取整到最小订货单位
+  ('rounding', 'ceil_to_min_order_unit'),  -- 建议量向上取整到最小订货单位
+  ('shelf_grouping', 'category_shelf_life'),          -- 批次台账按“品类保质期分组规则版本”登记
+  ('carryover_cost_source', 'rule_version'),          -- 结转成本归属由批次登记时的规则版本裁定
+  ('markdown_demand_label', 'markdown_demand'),       -- 折价回升销量单列为折价需求，不回喂模型
+  ('markdown_window_hour', '12'),                     -- 折价/报损跨日补录窗口：次日 12:00 前
+  ('reconciliation_grain', 'arrival_date')            -- 台账/结转/复盘按到货日逐项对账
 ON CONFLICT (key) DO NOTHING;
+
+-- =====================================================================
+-- 多期库存结转与临期折价子系统
+--   ① 批次台账（按保质期分组登记在库/在途/临期 + 到期日）
+--   ② 结转引擎（跨日滚存 + 成本归属，按批次+盘点时点幂等）
+--   ③ 折价治理（折价计划与折价需求单列，不回喂模型）
+--   ④ 历史复盘（按当时规则版本重算未确认区间，已确认订单不追溯）
+-- =====================================================================
+
+-- 品类保质期分组展示字段（生效口径以 shelf_rule_versions.rules 为准）
+ALTER TABLE categories ADD COLUMN IF NOT EXISTS shelf_group TEXT;
+ALTER TABLE categories ADD COLUMN IF NOT EXISTS shelf_life_days INT;
+
+-- 需求样本：折价需求单列标记（折价回升销量不进入训练）
+ALTER TABLE demand_samples ADD COLUMN IF NOT EXISTS demand_class TEXT NOT NULL DEFAULT 'regular';
+ALTER TABLE demand_samples ADD COLUMN IF NOT EXISTS markdown_uplift_qty NUMERIC NOT NULL DEFAULT 0;
+
+-- 复盘明细：多期结转成本归属（按批次登记时的规则版本裁定）
+ALTER TABLE review_items ADD COLUMN IF NOT EXISTS carryover_qty NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE review_items ADD COLUMN IF NOT EXISTS carryover_cost NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE review_items ADD COLUMN IF NOT EXISTS cost_attribution_date DATE;
+ALTER TABLE review_items ADD COLUMN IF NOT EXISTS replay_run_id INT;
+
+-- 复盘确认：确认后不参与重算/不追溯改写
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ;
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS confirmed_by TEXT;
+
+-- 保质期分组规则版本：不可变。规则一改就产生新版本，历史区间按“当时版本”重算
+CREATE TABLE IF NOT EXISTS shelf_rule_versions (
+  id             SERIAL PRIMARY KEY,
+  version_no     INT UNIQUE NOT NULL,
+  name           TEXT NOT NULL,
+  effective_from DATE NOT NULL,
+  effective_to   DATE,                       -- NULL = 仍在生效
+  status         TEXT NOT NULL DEFAULT 'active',  -- active / archived
+  rules          JSONB NOT NULL,             -- {groups:{LEAFY:{shelfLifeDays,carryoverAllowed,...}}, ...}
+  created_by     TEXT NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 批次台账：一个（门店,SKU,批次号）一条；到期日由登记时规则版本裁定
+CREATE TABLE IF NOT EXISTS batches (
+  id               SERIAL PRIMARY KEY,
+  store_id         INT NOT NULL REFERENCES stores(id),
+  sku_id           INT NOT NULL REFERENCES skus(id),
+  batch_no         TEXT NOT NULL,
+  rule_version_id  INT NOT NULL REFERENCES shelf_rule_versions(id),
+  arrival_date     DATE NOT NULL,
+  expiry_date      DATE NOT NULL,
+  shelf_life_days  INT NOT NULL,
+  received_qty     NUMERIC NOT NULL,
+  in_stock_qty     NUMERIC NOT NULL,
+  in_transit_qty   NUMERIC NOT NULL DEFAULT 0,
+  near_expiry_qty  NUMERIC NOT NULL DEFAULT 0,
+  unit_cost        NUMERIC NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'open',  -- open / closed
+  last_stocktake_at TIMESTAMPTZ,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(store_id, sku_id, batch_no)
+);
+
+-- 批次台账流水：登记/到货/盘点/结转/到期/当天清，按 ref_key 幂等
+CREATE TABLE IF NOT EXISTS batch_ledger_entries (
+  id             SERIAL PRIMARY KEY,
+  batch_id       INT NOT NULL REFERENCES batches(id),
+  business_date  DATE NOT NULL,
+  entry_type     TEXT NOT NULL,   -- register / arrive / stocktake / carryover / expiry / clearance
+  in_qty         NUMERIC NOT NULL DEFAULT 0,
+  out_qty        NUMERIC NOT NULL DEFAULT 0,
+  in_stock_after NUMERIC NOT NULL,
+  in_transit_after NUMERIC NOT NULL,
+  near_expiry_after NUMERIC NOT NULL,
+  ref_key        TEXT UNIQUE NOT NULL,
+  note           TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 批次盘点：与结转作业按（批次, 盘点时点）幂等合并；重复上报不生成两份结转
+CREATE TABLE IF NOT EXISTS batch_stocktakes (
+  id             SERIAL PRIMARY KEY,
+  store_id       INT NOT NULL REFERENCES stores(id),
+  sku_id         INT NOT NULL REFERENCES skus(id),
+  batch_id       INT NOT NULL REFERENCES batches(id),
+  business_date  DATE NOT NULL,
+  system_qty     NUMERIC NOT NULL,
+  actual_qty     NUMERIC NOT NULL,
+  difference     NUMERIC NOT NULL,
+  stocktake_at   TIMESTAMPTZ NOT NULL,
+  rule_version_id INT NOT NULL REFERENCES shelf_rule_versions(id),
+  excluded_from_training BOOLEAN NOT NULL DEFAULT FALSE,  -- 有差异的批次不进入训练样本
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(batch_id, stocktake_at)
+);
+
+-- 盘点差异/到期报废/当天清单独立账；账面与实物不符以盘点为准
+CREATE TABLE IF NOT EXISTS inventory_adjustments (
+  id            SERIAL PRIMARY KEY,
+  store_id      INT NOT NULL REFERENCES stores(id),
+  sku_id        INT NOT NULL REFERENCES skus(id),
+  batch_id      INT NOT NULL REFERENCES batches(id),
+  business_date DATE NOT NULL,
+  adjust_type   TEXT NOT NULL,   -- stocktake_variance / expiry_writeoff / clearance
+  qty           NUMERIC NOT NULL,       -- 盘点差异为带符号差额
+  unit_cost     NUMERIC NOT NULL,
+  amount        NUMERIC NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'pending_review',  -- pending_review / resolved
+  review_note   TEXT,
+  ref_key       TEXT UNIQUE NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 结转作业：一个（门店, 营业日, 盘点时点）一次；重复提交幂等返回
+CREATE TABLE IF NOT EXISTS carryover_runs (
+  id              SERIAL PRIMARY KEY,
+  store_id        INT NOT NULL REFERENCES stores(id),
+  business_date   DATE NOT NULL,
+  target_date     DATE NOT NULL,
+  rule_version_id INT NOT NULL REFERENCES shelf_rule_versions(id),
+  stocktake_at    TIMESTAMPTZ NOT NULL,
+  idempotency_key TEXT UNIQUE,
+  status          TEXT NOT NULL DEFAULT 'applied',
+  totals          JSONB NOT NULL DEFAULT '{}',
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(store_id, business_date, stocktake_at)
+);
+
+-- 同一（门店, 营业日）只允许一次结转作业：不同盘点时点再次提交也合并到该次，绝不重复滚存
+CREATE UNIQUE INDEX IF NOT EXISTS carryover_runs_one_per_business_day
+  ON carryover_runs(store_id, business_date);
+
+-- 结转明细：每批次一行，归到原到货日或结转日由规则版本裁定
+CREATE TABLE IF NOT EXISTS carryover_lines (
+  id              SERIAL PRIMARY KEY,
+  run_id          INT NOT NULL REFERENCES carryover_runs(id),
+  store_id        INT NOT NULL REFERENCES stores(id),
+  sku_id          INT NOT NULL REFERENCES skus(id),
+  batch_id        INT NOT NULL REFERENCES batches(id),
+  business_date   DATE NOT NULL,
+  target_date     DATE NOT NULL,
+  rule_version_id INT NOT NULL REFERENCES shelf_rule_versions(id),  -- 营业日生效版本（审计用）
+  batch_rule_version_id INT NOT NULL REFERENCES shelf_rule_versions(id), -- 批次登记版本：成本归属按它裁定
+  basis_qty       NUMERIC NOT NULL,   -- 结转基数（有盘点时以实盘为准）
+  expired_qty     NUMERIC NOT NULL,   -- 到期报废
+  cleared_qty     NUMERIC NOT NULL,   -- 当天清/不允许结转
+  carried_qty     NUMERIC NOT NULL,   -- 滚存次日
+  unit_cost       NUMERIC NOT NULL,
+  cost_amount     NUMERIC NOT NULL,
+  cost_attribution TEXT NOT NULL,     -- origin_arrival / carryover_date
+  attributed_date DATE NOT NULL,
+  stocktake_at    TIMESTAMPTZ NOT NULL,
+  note            TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(batch_id, stocktake_at)
+);
+
+-- 临期折价计划
+CREATE TABLE IF NOT EXISTS markdown_plans (
+  id              SERIAL PRIMARY KEY,
+  store_id        INT NOT NULL REFERENCES stores(id),
+  sku_id          INT NOT NULL REFERENCES skus(id),
+  batch_id        INT NOT NULL REFERENCES batches(id),
+  business_date   DATE NOT NULL,
+  rule_version_id INT NOT NULL REFERENCES shelf_rule_versions(id),
+  plan_qty        NUMERIC NOT NULL,
+  discount_rate   NUMERIC NOT NULL,   -- 0.7 = 七折
+  status          TEXT NOT NULL DEFAULT 'active',
+  idempotency_key TEXT UNIQUE NOT NULL,
+  created_by      TEXT NOT NULL,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 折价单（可跨日补录）：窗口内重算，过窗存档并注明出处
+CREATE TABLE IF NOT EXISTS markdown_entries (
+  id            SERIAL PRIMARY KEY,
+  plan_id       INT NOT NULL REFERENCES markdown_plans(id),
+  store_id      INT NOT NULL REFERENCES stores(id),
+  sku_id        INT NOT NULL REFERENCES skus(id),
+  business_date DATE NOT NULL,
+  sold_qty      NUMERIC NOT NULL,
+  recorded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  within_window BOOLEAN NOT NULL,
+  disposition   TEXT NOT NULL,  -- recalc / archived
+  note          TEXT,
+  entry_key     TEXT UNIQUE NOT NULL
+);
+
+-- 折价需求：折价回升销量单列，不当真实需求回喂模型
+CREATE TABLE IF NOT EXISTS markdown_demand (
+  id               SERIAL PRIMARY KEY,
+  plan_id          INT UNIQUE NOT NULL REFERENCES markdown_plans(id),
+  store_id         INT NOT NULL REFERENCES stores(id),
+  sku_id           INT NOT NULL REFERENCES skus(id),
+  business_date    DATE NOT NULL,
+  rule_version_id  INT NOT NULL REFERENCES shelf_rule_versions(id),
+  planned_qty      NUMERIC NOT NULL,
+  discount_rate    NUMERIC NOT NULL,
+  sold_qty         NUMERIC NOT NULL,
+  uplift_qty       NUMERIC NOT NULL,
+  base_qty         NUMERIC NOT NULL,
+  markdown_demand_qty NUMERIC NOT NULL DEFAULT 0,   -- 折价需求：折价回升中不计入真实需求的部分
+  real_demand_qty  NUMERIC NOT NULL DEFAULT 0,       -- 真实需求：基准量 + 折价回升中按规则计入的部分
+  recorded_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  within_window    BOOLEAN NOT NULL,
+  disposition      TEXT NOT NULL,
+  replay_run_id    INT
+);
+
+-- 历史复盘重算：只重算未确认区间
+CREATE TABLE IF NOT EXISTS replay_runs (
+  id          SERIAL PRIMARY KEY,
+  store_id    INT NOT NULL REFERENCES stores(id),
+  category_id INT REFERENCES categories(id),
+  date_from   DATE NOT NULL,
+  date_to     DATE NOT NULL,
+  mode        TEXT NOT NULL DEFAULT 'unconfirmed_only',
+  created_by  TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'done',
+  summary     JSONB NOT NULL DEFAULT '{}',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS replay_lines (
+  id              SERIAL PRIMARY KEY,
+  run_id          INT NOT NULL REFERENCES replay_runs(id),
+  store_id        INT NOT NULL REFERENCES stores(id),
+  sku_id          INT NOT NULL REFERENCES skus(id),
+  business_date   DATE NOT NULL,
+  review_id       INT REFERENCES reviews(id),
+  review_confirmed BOOLEAN NOT NULL,
+  rule_version_id INT REFERENCES shelf_rule_versions(id),
+  rule_version_no INT,
+  action          TEXT NOT NULL,  -- recomputed / unchanged / skipped_confirmed / markdown_recomputed / markdown_unchanged
+  old_cost        NUMERIC,
+  new_cost        NUMERIC,
+  old_attribution_date DATE,
+  new_attribution_date DATE,
+  delta           NUMERIC,
+  note            TEXT
+);
+
+-- 按到货日对账：台账 / 结转结果 / 复盘口径
+CREATE TABLE IF NOT EXISTS reconciliation_runs (
+  id         SERIAL PRIMARY KEY,
+  store_id   INT NOT NULL REFERENCES stores(id),
+  date_from  DATE NOT NULL,
+  date_to    DATE NOT NULL,
+  summary    JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS reconciliation_flags (
+  id            SERIAL PRIMARY KEY,
+  run_id        INT NOT NULL REFERENCES reconciliation_runs(id),
+  store_id      INT NOT NULL REFERENCES stores(id),
+  sku_id        INT NOT NULL REFERENCES skus(id),
+  arrival_date  DATE NOT NULL,
+  batch_id      INT NOT NULL REFERENCES batches(id),
+  flag_type     TEXT NOT NULL,  -- ledger_order_mismatch / stale_expired_stock / cost_exceeds_ledger / stocktake_variance_pending
+  ledger_qty    NUMERIC NOT NULL,
+  carryover_total NUMERIC NOT NULL,
+  review_qty    NUMERIC NOT NULL,
+  variance      NUMERIC NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'pending_review',  -- pending_review / resolved
+  note          TEXT,
+  resolved_by   TEXT,
+  resolved_at   TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(batch_id, flag_type)
+);
